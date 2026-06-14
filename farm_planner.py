@@ -209,6 +209,7 @@ class FarmManager:
         self.fertilizer_prices: dict[str, float] = dict(FERTILIZER_UNIT_PRICE)
         self.current_year: int = 2026
         self.plan_years: list = [2026]
+        self.budget_targets: dict = {}
         self._load()
 
     def _load(self):
@@ -229,6 +230,8 @@ class FarmManager:
         self.fertilizer_prices = data.get("fertilizer_prices", dict(FERTILIZER_UNIT_PRICE))
         self.current_year = data.get("current_year", 2026)
         self.plan_years = sorted(data.get("plan_years", [2026]))
+        raw_budget = data.get("budget_targets", {})
+        self.budget_targets = {int(k): v for k, v in raw_budget.items()}
         self._sync_plan_years()
 
     def _save(self):
@@ -244,6 +247,7 @@ class FarmManager:
             "fertilizer_prices": self.fertilizer_prices,
             "current_year": self.current_year,
             "plan_years": self.plan_years,
+            "budget_targets": self.budget_targets,
         }
         with open(self.data_file, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -687,6 +691,291 @@ class FarmManager:
                     writer.writerow(row)
         return filepath
 
+    def set_budget_target(self, year, budget=None, target_profit=None):
+        if year not in self.budget_targets:
+            self.budget_targets[year] = {"budget": None, "target_profit": None}
+        if budget is not None:
+            self.budget_targets[year]["budget"] = budget
+        if target_profit is not None:
+            self.budget_targets[year]["target_profit"] = target_profit
+        self._save()
+        return self.budget_targets[year]
+
+    def get_budget_target(self, year):
+        return self.budget_targets.get(year, {"budget": None, "target_profit": None})
+
+    def get_plan_table(self):
+        table = {}
+        for y in self.plan_years:
+            table[y] = {}
+            for fname in self.fields:
+                table[y][fname] = {}
+                for s in SEASON_ORDER:
+                    crop_name = ""
+                    for e in self.plan:
+                        if e.field_name == fname and e.year == y and e.season == s:
+                            crop_name = e.crop_name
+                            break
+                    table[y][fname][s] = crop_name
+        return table
+
+    def update_plan_cell(self, field_name, year, season, crop_name):
+        if not crop_name or crop_name.strip() == "":
+            self.plan = [e for e in self.plan
+                         if not (e.field_name == field_name and e.year == year and e.season == season)]
+            self._save()
+            return True, "已清空"
+        return self.add_plan_entry(field_name, year, season, crop_name.strip())
+
+    def copy_field_plan(self, from_year, to_year, field_name=None):
+        if from_year not in self.plan_years or to_year not in self.plan_years:
+            return 0, "年份不在规划期内"
+        count = 0
+        entries_to_copy = [e for e in self.plan if e.year == from_year]
+        if field_name is not None:
+            entries_to_copy = [e for e in entries_to_copy if e.field_name == field_name]
+        for e in entries_to_copy:
+            crop = self.crops.get(e.crop_name)
+            if crop and e.season in crop.seasons:
+                entry, err = self.add_plan_entry(e.field_name, to_year, e.season, e.crop_name)
+                if entry:
+                    count += 1
+        return count, f"已复制 {count} 条计划"
+
+    def get_cross_year_connections(self, year):
+        connections = []
+        prev_year = year - 1
+        if prev_year not in self.plan_years:
+            return connections
+        winter_entries = [e for e in self.plan
+                          if e.year == prev_year and e.season == Season.WINTER]
+        spring_entries = [e for e in self.plan
+                          if e.year == year and e.season == Season.SPRING]
+        for we in winter_entries:
+            for se in spring_entries:
+                if we.field_name == se.field_name and we.crop_name == se.crop_name:
+                    connections.append({
+                        "field": we.field_name,
+                        "prev_year": prev_year,
+                        "prev_season": Season.WINTER,
+                        "curr_year": year,
+                        "curr_season": Season.SPRING,
+                        "crop": we.crop_name,
+                        "penalty": self.ROTATION_PENALTY,
+                    })
+        return connections
+
+    def check_rotation_conflicts(self, year=None):
+        conflicts = []
+        entries_by_field = {}
+        plan_entries = self.plan if year is None else [e for e in self.plan if e.year == year]
+        for entry in plan_entries:
+            key = entry.field_name
+            if key not in entries_by_field:
+                entries_by_field[key] = []
+            entries_by_field[key].append(entry)
+
+        if year is not None:
+            cross = self.get_cross_year_connections(year)
+            conflicts.extend(cross)
+
+        for fname, entries in entries_by_field.items():
+            entries_sorted = sorted(
+                entries,
+                key=lambda e: _season_sort_key(e.year, e.season)
+            )
+            for i in range(1, len(entries_sorted)):
+                prev = entries_sorted[i - 1]
+                curr = entries_sorted[i]
+                if not self._are_seasons_adjacent(prev.year, prev.season, curr.year, curr.season):
+                    continue
+                if prev.crop_name == curr.crop_name:
+                    conflicts.append({
+                        "field": fname,
+                        "prev_year": prev.year,
+                        "prev_season": prev.season,
+                        "curr_year": curr.year,
+                        "curr_season": curr.season,
+                        "crop": curr.crop_name,
+                        "penalty": self.ROTATION_PENALTY,
+                    })
+        return conflicts
+
+    def budget_analysis(self, year):
+        target = self.get_budget_target(year)
+        profit_data = self.profit_analysis(year)[year]
+        result = {
+            "year": year,
+            "total_revenue": profit_data["total_revenue"],
+            "total_cost": profit_data["total_cost"],
+            "total_profit": profit_data["total_profit"],
+            "budget": target.get("budget"),
+            "target_profit": target.get("target_profit"),
+            "budget_status": None,
+            "target_status": None,
+        }
+        if target.get("budget") is not None:
+            over = profit_data["total_cost"] - target["budget"]
+            result["budget_status"] = {
+                "over_amount": over,
+                "over_pct": (over / target["budget"] * 100) if target["budget"] > 0 else 0,
+                "is_over": over > 0,
+            }
+        if target.get("target_profit") is not None:
+            gap = target["target_profit"] - profit_data["total_profit"]
+            result["target_status"] = {
+                "gap_amount": gap,
+                "gap_pct": (gap / target["target_profit"] * 100) if target["target_profit"] > 0 else 0,
+                "is_met": gap <= 0,
+            }
+        return result
+
+    def optimization_suggestions(self, year):
+        suggestions = []
+        ba = self.budget_analysis(year)
+
+        if ba.get("budget_status", {}).get("is_over"):
+            suggestions.append({
+                "type": "budget",
+                "priority": "高",
+                "title": "预算超支警告",
+                "detail": f"当前计划成本¥{ba['total_cost']:,.0f}，超出预算¥{ba['budget_status']['over_amount']:,.0f} ({ba['budget_status']['over_pct']:+.1f}%)",
+                "actions": [],
+            })
+
+            cost_details = []
+            for s in SEASON_ORDER:
+                _, bd, _ = self.calculate_season_costs(year, s)
+                for k, v in bd.items():
+                    cost_details.append((f"{s.value}-{k}", v))
+            cost_details.sort(key=lambda x: x[1], reverse=True)
+            if cost_details:
+                top = cost_details[0]
+                suggestions[0]["actions"].append(
+                    f"最大支出来源: {top[0]} (¥{top[1]:,.0f})，考虑缩减高成本作物")
+
+            for fname, fld in self.fields.items():
+                for s in SEASON_ORDER:
+                    for e in self.plan:
+                        if e.field_name == fname and e.year == year and e.season == s:
+                            crop = self.crops.get(e.crop_name)
+                            if crop:
+                                _, bd, _ = self.calculate_season_costs(year, s)
+                                rev, _ = self.estimate_income(year, s)
+                                profit = rev - sum(bd.values())
+                                c = self.costs.get(e.crop_name, {})
+                                seed = c.get("seed_per_mu", 0) * fld.area
+                                if seed > 1000:
+                                    suggestions[0]["actions"].append(
+                                        f"{fname} {s.value} {e.crop_name} 种子成本较高(¥{seed:,.0f})，可考虑换低成本品种")
+
+        if ba.get("target_status") and not ba["target_status"]["is_met"]:
+            suggestions.append({
+                "type": "target",
+                "priority": "中",
+                "title": "未达目标收益",
+                "detail": f"当前净收益¥{ba['total_profit']:,.0f}，距目标还差¥{ba['target_status']['gap_amount']:,.0f}",
+                "actions": [],
+            })
+            profit_data = self.profit_analysis(year)[year]
+            season_profits = [(s.value, profit_data["seasons"][s]["profit"]) for s in SEASON_ORDER]
+            season_profits.sort(key=lambda x: x[1])
+            if season_profits and season_profits[0][1] < 0:
+                suggestions[1]["actions"].append(
+                    f"{season_profits[0][0]}亏损¥{abs(season_profits[0][1]):,.0f}，可考虑调整作物")
+
+            crop_profits = {}
+            for e in self.plan:
+                if e.year != year:
+                    continue
+                crop = self.crops.get(e.crop_name)
+                fld = self.fields.get(e.field_name)
+                if crop and fld:
+                    y = self.predict_yield(e.field_name, year, e.season, e.crop_name)
+                    rev = y * self.prices.get(e.crop_name, 0)
+                    c = self.costs.get(e.crop_name, {})
+                    sc = c.get("seed_per_mu", 0) * fld.area
+                    ic = c.get("irrigation_per_mu", 0) * fld.area
+                    lc = c.get("labor_per_mu", 0) * fld.area
+                    fc = sum(crop.npk_per_mu.get(k, 0) * self.fertilizer_prices.get(k, 0) * fld.area
+                             for k in ["N", "P", "K"])
+                    total_c = sc + fc + ic + lc
+                    p = rev - total_c
+                    key = f"{e.field_name} {e.season.value} {e.crop_name}"
+                    crop_profits[key] = p
+            low_profit = sorted(crop_profits.items(), key=lambda x: x[1])[:2]
+            for key, p in low_profit:
+                if p < 500:
+                    suggestions[1]["actions"].append(f"{key} 收益较低(¥{p:,.0f})，可考虑换高收益作物")
+
+        rotation_conflicts = self.check_rotation_conflicts(year=year)
+        if rotation_conflicts:
+            suggestions.append({
+                "type": "rotation",
+                "priority": "低",
+                "title": "轮作优化建议",
+                "detail": f"发现 {len(rotation_conflicts)} 处轮作冲突，建议调整避免减产",
+                "actions": [f"{cf['field']} {cf['prev_year']}年{cf['prev_season'].value}→{cf['curr_year']}年{cf['curr_season'].value} 连续{cf['crop']}" for cf in rotation_conflicts],
+            })
+
+        return suggestions
+
+    def deviation_trend_by_field(self, field_name):
+        reports = self.deviation_analysis()
+        field_reports = [r for r in reports if r["field"] == field_name]
+        if not field_reports:
+            return []
+        by_year = {}
+        for r in field_reports:
+            y = r["year"]
+            if y not in by_year:
+                by_year[y] = {"count": 0, "predicted": 0.0, "actual": 0.0}
+            by_year[y]["count"] += 1
+            by_year[y]["predicted"] += r["predicted_kg"]
+            by_year[y]["actual"] += r["actual_kg"]
+        result = []
+        for y in sorted(by_year.keys()):
+            d = by_year[y]
+            dev = d["actual"] - d["predicted"]
+            dev_pct = (dev / d["predicted"] * 100) if d["predicted"] > 0 else 0
+            result.append({
+                "year": y,
+                "count": d["count"],
+                "predicted": d["predicted"],
+                "actual": d["actual"],
+                "deviation": dev,
+                "deviation_pct": dev_pct,
+            })
+        return result
+
+    def deviation_trend_by_crop(self, crop_name):
+        reports = self.deviation_analysis()
+        crop_reports = [r for r in reports if r["crop"] == crop_name]
+        if not crop_reports:
+            return []
+        by_year = {}
+        for r in crop_reports:
+            y = r["year"]
+            if y not in by_year:
+                by_year[y] = {"count": 0, "predicted": 0.0, "actual": 0.0}
+            by_year[y]["count"] += 1
+            by_year[y]["predicted"] += r["predicted_kg"]
+            by_year[y]["actual"] += r["actual_kg"]
+        result = []
+        for y in sorted(by_year.keys()):
+            d = by_year[y]
+            dev = d["actual"] - d["predicted"]
+            dev_pct = (dev / d["predicted"] * 100) if d["predicted"] > 0 else 0
+            result.append({
+                "year": y,
+                "count": d["count"],
+                "predicted": d["predicted"],
+                "actual": d["actual"],
+                "deviation": dev,
+                "deviation_pct": dev_pct,
+            })
+        return result
+
     def generate_calendar(self, year=None):
         years = [year] if year else self.plan_years
         if not self.fields:
@@ -763,12 +1052,42 @@ class FarmManager:
 
         conflicts = self.check_rotation_conflicts(year=year)
         if conflicts:
-            print("\n  ⚠ 轮作冲突警告:")
-            for cf in conflicts:
-                prev_label = f"{cf['prev_year']}年{cf['prev_season'].value}"
-                curr_label = f"{cf['curr_year']}年{cf['curr_season'].value}"
-                print(f"    - {cf['field']}: {prev_label}→{curr_label} "
-                      f"连续种植{cf['crop']}，减产{cf['penalty']*100:.0f}%")
+            cross_year = [cf for cf in conflicts if cf["prev_year"] != cf["curr_year"]]
+            same_year = [cf for cf in conflicts if cf["prev_year"] == cf["curr_year"]]
+            if cross_year and year is not None:
+                print("\n  🔗 跨年连接提示 (与上一年冬季衔接):")
+                for cf in cross_year:
+                    prev_label = f"{cf['prev_year']}年{cf['prev_season'].value}"
+                    curr_label = f"{cf['curr_year']}年{cf['curr_season'].value}"
+                    print(f"    - {cf['field']}: {prev_label}→{curr_label} "
+                          f"连续种植{cf['crop']}，减产{cf['penalty']*100:.0f}%")
+            if same_year:
+                print("\n  ⚠ 轮作冲突警告:")
+                for cf in same_year:
+                    prev_label = f"{cf['prev_year']}年{cf['prev_season'].value}"
+                    curr_label = f"{cf['curr_year']}年{cf['curr_season'].value}"
+                    print(f"    - {cf['field']}: {prev_label}→{curr_label} "
+                          f"连续种植{cf['crop']}，减产{cf['penalty']*100:.0f}%")
+        elif year is not None and year > min(self.plan_years):
+            cross = self.get_cross_year_connections(year)
+            if not cross:
+                prev_year = year - 1
+                if prev_year in self.plan_years:
+                    winter_crops = [(e.field_name, e.crop_name) for e in self.plan
+                                    if e.year == prev_year and e.season == Season.WINTER]
+                    spring_crops = [(e.field_name, e.crop_name) for e in self.plan
+                                    if e.year == year and e.season == Season.SPRING]
+                    if winter_crops and spring_crops:
+                        print("\n  🔗 跨年衔接 (与上一年冬季):")
+                        for fname, wcrop in winter_crops:
+                            scrop = next((sc for fn, sc in spring_crops if fn == fname), None)
+                            if scrop:
+                                if wcrop != scrop:
+                                    print(f"    - {fname}: {prev_year}年冬季({wcrop})→{year}年春季({scrop}) 正常轮作 ✓")
+                                else:
+                                    print(f"    - {fname}: {prev_year}年冬季({wcrop})→{year}年春季({scrop}) 连续种植 ⚠")
+                            else:
+                                print(f"    - {fname}: {prev_year}年冬季({wcrop})→{year}年春季(空置)")
         print()
 
 
@@ -842,6 +1161,9 @@ class CLI:
         print("  11. 查看田块种植日历")
         print("  12. 配置价格与成本")
         print("  13. 设置规划年限")
+        print("  14. 多年度表格排期")
+        print("  15. 经营决策工具 (预算/目标/建议)")
+        print("  16. 偏差趋势分析 (按年份)")
         print("  0.  退出")
         print_separator()
         choice = input("  请选择功能: ").strip()
@@ -859,6 +1181,9 @@ class CLI:
             "11": self._view_calendar,
             "12": self._configure_prices_costs,
             "13": self._configure_years,
+            "14": self._multi_year_table,
+            "15": self._business_decision,
+            "16": self._deviation_trend,
             "0": self._exit,
         }
         action = actions.get(choice)
@@ -972,12 +1297,22 @@ class CLI:
 
         conflicts = self.mgr.check_rotation_conflicts()
         if conflicts:
-            print("\n  ⚠ 轮作冲突:")
-            for cf in conflicts:
-                prev_label = f"{cf['prev_year']}年{cf['prev_season'].value}"
-                curr_label = f"{cf['curr_year']}年{cf['curr_season'].value}"
-                print(f"    {cf['field']}: {prev_label}→{curr_label} "
-                      f"连续种植{cf['crop']}，减产{cf['penalty']*100:.0f}%")
+            cross_year = [cf for cf in conflicts if cf["prev_year"] != cf["curr_year"]]
+            same_year = [cf for cf in conflicts if cf["prev_year"] == cf["curr_year"]]
+            if cross_year:
+                print("\n  🔗 跨年轮作冲突:")
+                for cf in cross_year:
+                    prev_label = f"{cf['prev_year']}年{cf['prev_season'].value}"
+                    curr_label = f"{cf['curr_year']}年{cf['curr_season'].value}"
+                    print(f"    {cf['field']}: {prev_label}→{curr_label} "
+                          f"连续种植{cf['crop']}，减产{cf['penalty']*100:.0f}%")
+            if same_year:
+                print("\n  ⚠ 年轮作冲突:")
+                for cf in same_year:
+                    prev_label = f"{cf['prev_year']}年{cf['prev_season'].value}"
+                    curr_label = f"{cf['curr_year']}年{cf['curr_season'].value}"
+                    print(f"    {cf['field']}: {prev_label}→{curr_label} "
+                          f"连续种植{cf['crop']}，减产{cf['penalty']*100:.0f}%")
 
         print("\n  1. 添加/修改计划条目  2. 删除计划条目  3. 快速批量规划  4. 返回")
         c = input("  选择: ").strip()
@@ -1529,6 +1864,215 @@ class CLI:
             print(f"  ✓ 已设置规划年限: {start_year}-{start_year+num_years-1} ({num_years}年)")
         else:
             print("  已取消")
+
+    def _multi_year_table(self):
+        print("\n  === 多年度表格排期 ===")
+        if not self.mgr.fields:
+            print("  请先添加农田")
+            return
+        if len(self.mgr.plan_years) < 2:
+            print("  建议先设置规划年限（至少2年）以使用表格排期")
+        years = self.mgr.plan_years
+        fields = list(self.mgr.fields.keys())
+
+        while True:
+            table = self.mgr.get_plan_table()
+            print()
+            print_separator("═", 120)
+            header = f"  {'农田':<12}"
+            for y in years:
+                header += f" │ {y}年春 │ {y}年夏 │ {y}年秋 │ {y}年冬 │"
+            print(header)
+            print_separator("─", 120)
+            for fname in fields:
+                row = f"  {fname:<12}"
+                for y in years:
+                    for s in SEASON_ORDER:
+                        crop = table[y][fname][s]
+                        display = crop if crop else "  —  "
+                        row += f" │ {display:<7}"
+                    row += " │"
+                print(row)
+            print_separator("═", 120)
+
+            cross_info = []
+            for y in years[1:]:
+                conn = self.mgr.get_cross_year_connections(y)
+                if conn:
+                    for c in conn:
+                        cross_info.append(
+                            f"  🔗 {y-1}年冬→{y}年春: {c['field']} 连续{c['crop']} ⚠")
+            if cross_info:
+                print("  " + "  ".join(cross_info))
+
+            print()
+            print("  操作: [M]修改单元格  [C]复制到下一年  [R]复制某行到下一年  [B]返回")
+            op = input("  选择操作: ").strip().upper()
+            if op == "B":
+                return
+            elif op == "M":
+                print("  选择要修改的单元格:")
+                for i, f in enumerate(fields, 1):
+                    print(f"    {i}. {f}")
+                fi = input("  农田编号: ").strip()
+                if not (fi.isdigit() and 1 <= int(fi) <= len(fields)):
+                    continue
+                fname = fields[int(fi) - 1]
+
+                year_opts = [str(y) for y in years]
+                yi = select_from_list(year_opts, "选择年份")
+                y = years[yi]
+
+                season_opts = [s.value for s in SEASON_ORDER]
+                si = select_from_list(season_opts, "选择季节")
+                s = SEASON_ORDER[si]
+
+                suitable = [cn for cn in self.mgr.crops if s in self.mgr.crops[cn].seasons]
+                suitable.insert(0, "(清空)")
+                ci = select_from_list(suitable, "选择作物（0清空）")
+                if ci == 0:
+                    crop_name = ""
+                else:
+                    crop_name = suitable[ci]
+                _, err = self.mgr.update_plan_cell(fname, y, s, crop_name)
+                if err:
+                    print(f"  ✗ {err}")
+                else:
+                    print(f"  ✓ 已更新: {fname} {y}年{s.value} → {crop_name or '(空)'}")
+            elif op == "C":
+                from_year_opts = [str(y) for y in years[:-1]]
+                if not from_year_opts:
+                    print("  没有可复制的年份")
+                    continue
+                yi = select_from_list(from_year_opts, "从哪一年复制")
+                from_y = years[yi]
+                to_y = from_y + 1
+                count, msg = self.mgr.copy_field_plan(from_y, to_y)
+                print(f"  {msg}")
+            elif op == "R":
+                from_year_opts = [str(y) for y in years[:-1]]
+                if not from_year_opts:
+                    print("  没有可复制的年份")
+                    continue
+                yi = select_from_list(from_year_opts, "从哪一年复制")
+                from_y = years[yi]
+                to_y = from_y + 1
+                for i, f in enumerate(fields, 1):
+                    print(f"    {i}. {f}")
+                fi = input("  选择农田编号: ").strip()
+                if not (fi.isdigit() and 1 <= int(fi) <= len(fields)):
+                    continue
+                fname = fields[int(fi) - 1]
+                count, msg = self.mgr.copy_field_plan(from_y, to_y, fname)
+                print(f"  {msg}")
+
+    def _business_decision(self):
+        print("\n  === 经营决策工具 ===")
+        print("  1. 设置年度预算与目标  2. 查看预算达成分析  3. 优化建议  4. 返回")
+        c = input("  选择: ").strip()
+
+        if c == "1":
+            year = self._select_year("选择年份")
+            if year is None:
+                return
+            current = self.mgr.get_budget_target(year)
+            print(f"\n  {year}年当前设置:")
+            if current.get("budget") is not None:
+                print(f"    年度总成本预算: ¥{current['budget']:,.2f}")
+            else:
+                print(f"    年度总成本预算: 未设置")
+            if current.get("target_profit") is not None:
+                print(f"    目标净收益: ¥{current['target_profit']:,.2f}")
+            else:
+                print(f"    目标净收益: 未设置")
+            budget = input_float("  设置年度总成本预算 (元, 留空跳过): ", current.get("budget"))
+            target = input_float("  设置目标净收益 (元, 留空跳过): ", current.get("target_profit"))
+            self.mgr.set_budget_target(year, budget=budget, target_profit=target)
+            print(f"  ✓ {year}年预算与目标已更新")
+
+        elif c == "2":
+            year = self._select_year("选择年份")
+            if year is None:
+                return
+            ba = self.mgr.budget_analysis(year)
+            print(f"\n  {year}年预算达成分析:")
+            print(f"    预计毛收入: ¥{ba['total_revenue']:,.2f}")
+            print(f"    预计总成本: ¥{ba['total_cost']:,.2f}")
+            print(f"    预计净收益: ¥{ba['total_profit']:,.2f}")
+            if ba["budget"] is not None:
+                bs = ba["budget_status"]
+                status = "✓ 预算内" if not bs["is_over"] else "✗ 超预算"
+                print(f"\n    成本预算: ¥{ba['budget']:,.2f}")
+                print(f"    预算状态: {status} ({bs['over_pct']:+.1f}%)")
+                if bs["is_over"]:
+                    print(f"    超出金额: ¥{bs['over_amount']:,.2f}")
+            if ba["target_profit"] is not None:
+                ts = ba["target_status"]
+                status = "✓ 已达成" if ts["is_met"] else "✗ 未达成"
+                print(f"\n    目标净收益: ¥{ba['target_profit']:,.2f}")
+                print(f"    目标状态: {status} ({ts['gap_pct']:+.1f}%)")
+                if not ts["is_met"]:
+                    print(f"    还差金额: ¥{ts['gap_amount']:,.2f}")
+
+        elif c == "3":
+            year = self._select_year("选择年份")
+            if year is None:
+                return
+            suggestions = self.mgr.optimization_suggestions(year)
+            if not suggestions:
+                print(f"\n  {year}年经营状态良好，暂无优化建议 ✓")
+                return
+            print(f"\n  {year}年优化建议:")
+            priority_map = {"高": "🔴", "中": "🟡", "低": "🟢"}
+            for i, s in enumerate(suggestions, 1):
+                icon = priority_map.get(s["priority"], "")
+                print(f"\n  {icon} [{s['priority']}] {i}. {s['title']}")
+                print(f"     {s['detail']}")
+                if s["actions"]:
+                    print(f"     建议:")
+                    for a in s["actions"]:
+                        print(f"       • {a}")
+
+    def _deviation_trend(self):
+        print("\n  === 偏差趋势分析 (按年份) ===")
+        print("  1. 按作物查看趋势  2. 按农田查看趋势  3. 返回")
+        c = input("  选择: ").strip()
+
+        if c == "1":
+            crop_names = list(self.mgr.crops.keys())
+            if not crop_names:
+                print("  暂无作物")
+                return
+            ci = select_from_list(crop_names, "选择作物")
+            crop_name = crop_names[ci]
+            trend = self.mgr.deviation_trend_by_crop(crop_name)
+            if not trend:
+                print(f"\n  {crop_name} 暂无偏差记录")
+                return
+            print(f"\n  {crop_name} 年度偏差趋势:")
+            print(f"  {'年份':<8} {'记录数':<8} {'预测(kg)':<14} {'实际(kg)':<14} {'偏差(kg)':<14} {'偏差%':<12} 趋势")
+            print_separator("─", 90)
+            for t in trend:
+                trend_sym = "↗ 偏高" if t["deviation_pct"] > 5 else ("↘ 偏低" if t["deviation_pct"] < -5 else "— 正常")
+                print(f"  {t['year']:<8} {t['count']:<8} {t['predicted']:<14.1f} {t['actual']:<14.1f} {t['deviation']:<+14.1f} {t['deviation_pct']:<+12.1f}%  {trend_sym}")
+
+        elif c == "2":
+            field_names = list(self.mgr.fields.keys())
+            if not field_names:
+                print("  暂无农田")
+                return
+            fi = select_from_list(field_names, "选择农田")
+            field_name = field_names[fi]
+            trend = self.mgr.deviation_trend_by_field(field_name)
+            if not trend:
+                print(f"\n  {field_name} 暂无偏差记录")
+                return
+            print(f"\n  {field_name} 年度偏差趋势:")
+            print(f"  {'年份':<8} {'记录数':<8} {'预测(kg)':<14} {'实际(kg)':<14} {'偏差(kg)':<14} {'偏差%':<12} 趋势")
+            print_separator("─", 90)
+            for t in trend:
+                trend_sym = "↗ 偏高" if t["deviation_pct"] > 5 else ("↘ 偏低" if t["deviation_pct"] < -5 else "— 正常")
+                print(f"  {t['year']:<8} {t['count']:<8} {t['predicted']:<14.1f} {t['actual']:<14.1f} {t['deviation']:<+14.1f} {t['deviation_pct']:<+12.1f}%  {trend_sym}")
 
     def _exit(self):
         print("\n  再见! 🌾")
